@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Budget FR Delivery'
+  short_description: 'Préparer et livrer les changements Budget FR'
+  default_prompt: 'Utilise $budget-fr-delivery pour préparer et sécuriser la livraison d’un changement Budget FR.'
+policy:
+  allow_implicit_invocation: true
