@@ -7,6 +7,10 @@ Ce document décrit le fork au commit indiqué ci-dessous. Il distingue les fait
 observés dans le code des recommandations qui doivent encore être validées par
 une ADR.
 
+> **Note historique :** ce diagnostic a été réalisé avant ADR-0002 et sa
+> conclusion de gate reflète cet instant. ADR-0002 a ensuite été créée et
+> constitue désormais la décision applicable.
+
 ## 1. Commit baseline
 
 | Élément                   | Valeur observée                               |

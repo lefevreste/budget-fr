@@ -1,9 +1,9 @@
 # Spécification fonctionnelle — Budget intelligent France
 
-**Version :** 0.1  
-**Date :** 01/09/2026  
-**Statut :** cadrage MVP  
-**Nom de travail :** Budget FR  
+**Version :** 0.1
+**Date :** 01/09/2026
+**Statut :** cadrage MVP
+**Nom de travail :** Budget FR
 **Référence fonctionnelle :** classeur `Budget_famille_202608.xlsx`
 
 ---
@@ -406,7 +406,7 @@ Une règle configurable peut affecter un revenu reçu en fin de mois M au budget
 
 Exemple :
 
-`bankDate = 28/08/2026`  
+`bankDate = 28/08/2026`
 `budgetPeriod = 2026-09`
 
 La date bancaire reste 28/08/2026.
@@ -556,6 +556,11 @@ Chaque changement significatif conserve :
 - date ;
 - origine ;
 - commentaire éventuel.
+
+Le journal d'audit métier complet reste l'objectif fonctionnel cible. Pour le
+MVP, ADR-0002 autorise uniquement la persistance de la provenance courante via
+`budget_period_source` et `budget_period_rule_id`. Le journal complet est
+reporté après le MVP.
 
 ### BR-019 — Aucune utilisation de nombres flottants
 

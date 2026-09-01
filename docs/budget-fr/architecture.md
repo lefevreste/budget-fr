@@ -1,9 +1,9 @@
 # Budget FR — Architecture technique
 
-**Version :** 0.1  
-**Date :** 01/09/2026  
-**Statut :** architecture de cadrage  
-**Base :** fork de `actualbudget/actual`  
+**Version :** 0.1
+**Date :** 01/09/2026
+**Statut :** architecture de cadrage
+**Base :** fork de `actualbudget/actual`
 **Document fonctionnel associé :** `functional-spec-budget-fr-v0.1.md`
 
 ---
