@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Budget FR Engineering'
+  short_description: 'Concevoir et faire évoluer Budget FR dans Actual Budget'
+  default_prompt: 'Utilise $budget-fr-engineering pour concevoir une évolution Budget FR conforme à l’architecture Actual.'
+policy:
+  allow_implicit_invocation: true
