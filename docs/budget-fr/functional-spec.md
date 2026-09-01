@@ -728,7 +728,7 @@ Vue par poste :
 Tableau :
 
 | Mois | Solde début | Revenus | Fixes | Variables | Variation | Solde fin |
-|---|---:|---:|---:|---:|---:|---:|
+| ---- | ----------: | ------: | ----: | --------: | --------: | --------: |
 
 La sélection d'un mois ouvre le détail des opérations qui construisent la prévision.
 
@@ -1105,4 +1105,3 @@ Elle permet ensuite de construire proprement :
 - les scénarios ;
 - le rapprochement bancaire ;
 - l'IA explicative.
-
