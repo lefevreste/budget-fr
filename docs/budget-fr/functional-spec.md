@@ -8,6 +8,30 @@
 
 ---
 
+## Références de décision
+
+La décision de référence pour l'affectation de période budgétaire est
+[ADR-0006 — Affectation de période budgétaire en couches](./adr/0006-layered-budget-period-assignment.md).
+Elle s'appuie sur le [premier POC de concurrence](./spikes/budget-period-crdt.md)
+et le [POC de l'option D](./spikes/budget-period-option-d.md). ADR-0002 reste
+consultable comme historique, mais n'est plus normative pour la persistance et
+les comportements d'affectation remplacés par ADR-0006.
+
+---
+
+## Statut de livraison temporaire
+
+Ce statut de livraison est temporaire, distinct des exigences fonctionnelles et
+ne constitue pas une exigence produit permanente :
+
+- ADR-0006 : **ACCEPTÉE** ;
+- Architecture option D :
+  **READY FOR EXPERIMENTAL / TEST-FIRST IMPLEMENTATION** ;
+- Migration, activation et livraison en production :
+  **NOT READY FOR PRODUCTION MIGRATION OR RELEASE**.
+
+---
+
 ## 1. Vision
 
 Budget FR est une application de gestion budgétaire destinée en priorité aux foyers français.
@@ -64,6 +88,10 @@ Le produit doit notamment gérer correctement :
 La date d'une transaction importée représente le fait bancaire réel et doit rester inchangée.
 
 Une propriété distincte `budgetPeriod` détermine son mois budgétaire.
+
+`budgetPeriod` est toujours la période effective : la correction manuelle si
+elle existe, sinon l'affectation produite par une règle si elle existe, sinon le
+mois de `bankDate`.
 
 ### PF-002 — Les calculs sont déterministes
 
@@ -215,16 +243,30 @@ Attributs :
 
 - `id`
 - `bankTransactionId`
+- `manualBudgetPeriod`
+- `ruleAssignment`
 - `budgetPeriod`
+- `budgetPeriodSource`
 - `categoryId`
 - `transactionNature`
 - `budgetStatus`
 - `includedInBudget`
 - `recurrenceId`
 - `forecastItemId`
-- `source`
 - `confidence`
-- `manualOverride`
+
+Pour l'affectation de période :
+
+- `manualBudgetPeriod` représente une correction manuelle facultative ;
+- `ruleAssignment` représente la dernière affectation produite par une règle,
+  avec sa période et l'identifiant de la règle ;
+- `budgetPeriod` est la période effective dérivée ;
+- `budgetPeriodSource` est la provenance dérivée `manual`, `rule` ou `default`,
+  correspondant respectivement à une correction manuelle, une affectation par
+  règle ou au mois bancaire.
+
+Les deux dernières valeurs décrivent le résultat courant. Elles ne constituent
+ni une couche d'affectation supplémentaire ni un historique des changements.
 
 Natures initiales :
 
@@ -287,6 +329,10 @@ Actions possibles :
 - rattacher à une récurrence ;
 - ajouter une note ;
 - proposer un rapprochement.
+
+Une action de règle qui affecte le mois budgétaire ne modifie jamais une
+correction manuelle existante. Elle met uniquement à jour l'affectation par
+règle, qui peut rester masquée tant que la correction manuelle existe.
 
 ### 5.7 RecurringItem
 
@@ -396,7 +442,13 @@ Exemples :
 
 ### BR-001 — Mois budgétaire par défaut
 
-Sans règle particulière :
+La période budgétaire effective suit toujours cet ordre :
+
+1. correction manuelle si elle existe ;
+2. affectation produite par une règle si elle existe ;
+3. mois de `bankDate` sinon.
+
+Sans correction manuelle ni affectation par règle :
 
 `budgetPeriod = mois(bankDate)`
 
@@ -419,13 +471,18 @@ Cette règle doit pouvoir être définie par créancier ou récurrence.
 
 ### BR-004 — Priorité à l'affectation manuelle
 
-Priorité :
+Pour le mois budgétaire, toute correction manuelle a priorité sur toute
+affectation par règle, indépendamment de l'ordre dans lequel elles ont été
+produites ou reçues.
 
-1. correction manuelle verrouillée ;
-2. règle utilisateur explicite ;
-3. règle système ;
-4. classification automatique ;
-5. valeur par défaut.
+Supprimer la correction manuelle révèle la dernière affectation par règle. S'il
+n'en existe aucune, le mois budgétaire redevient le mois de `bankDate`.
+
+Un import, un réimport, un rapprochement ou une règle ne remplace jamais une
+correction manuelle. Les priorités entre règles utilisateur, règles système et
+classifications automatiques déterminent quelle affectation par règle est
+produite ; elles ne remettent pas en cause la priorité de la correction
+manuelle.
 
 ### BR-005 — Transferts internes
 
@@ -434,6 +491,10 @@ Un transfert entre deux comptes appartenant au même foyer :
 - ne constitue ni un revenu ni une dépense ;
 - ne doit pas modifier le résultat global du foyer ;
 - peut modifier la trésorerie de chaque compte.
+
+La propagation d'une affectation de période entre les lignes d'un split ou les
+deux côtés d'un transfert fait l'objet d'une décision distincte. Elle n'est pas
+résolue par la présente règle fonctionnelle.
 
 ### BR-006 — Hors budget
 
@@ -548,7 +609,8 @@ Les opérations du mois restent modifiables, mais toute modification après clô
 
 ### BR-018 — Audit
 
-Chaque changement significatif conserve :
+Le journal d'audit métier complet reste un objectif fonctionnel cible. Pour
+chaque changement significatif, il devra pouvoir conserver :
 
 - ancienne valeur ;
 - nouvelle valeur ;
@@ -557,10 +619,11 @@ Chaque changement significatif conserve :
 - origine ;
 - commentaire éventuel.
 
-Le journal d'audit métier complet reste l'objectif fonctionnel cible. Pour le
-MVP, ADR-0002 autorise uniquement la persistance de la provenance courante via
-`budget_period_source` et `budget_period_rule_id`. Le journal complet est
-reporté après le MVP.
+La provenance courante d'une période indique seulement si le résultat vient
+d'une correction manuelle, d'une règle ou du mois bancaire. L'identifiant de
+la règle explique l'affectation automatique courante. Ces informations ne sont
+pas un historique des changements et ne remplacent pas le futur journal
+d'audit métier, reporté après le MVP.
 
 ### BR-019 — Aucune utilisation de nombres flottants
 
@@ -572,6 +635,26 @@ Une même échéance ne peut être simultanément comptée :
 
 - comme prévision ;
 - et comme transaction réelle rapprochée.
+
+### BR-021 — Cycle de vie d'une affectation par règle
+
+La suppression ou la désactivation d'une règle ne modifie pas rétroactivement
+les affectations déjà produites par cette règle.
+
+Une réévaluation demandée explicitement peut remplacer ou retirer uniquement
+l'affectation par règle. Elle ne modifie jamais une correction manuelle, même
+si celle-ci masque le nouveau résultat automatique.
+
+### BR-022 — Réinitialisation de la période budgétaire
+
+Une réinitialisation complète retire la correction manuelle et l'affectation
+par règle. En l'absence d'une action concurrente plus récente, la période
+effective redevient le mois de `bankDate`.
+
+Entre appareils, des états intermédiaires peuvent être visibles pendant la
+synchronisation. Après convergence, tous les appareils compatibles doivent
+aboutir au même résultat, déterminé séparément pour la correction manuelle et
+l'affectation par règle.
 
 ---
 
@@ -647,6 +730,11 @@ ALORS
 
 Les règles doivent être testables avant activation sur l'historique.
 
+Désactiver ou supprimer une règle ne relance pas automatiquement son exécution
+sur les opérations déjà affectées. Une réévaluation de ces opérations est une
+action explicite, prévisualisable, qui ne peut modifier que leur affectation
+par règle.
+
 ---
 
 ## 9. Prévision déterministe 12 mois
@@ -708,6 +796,10 @@ Colonnes principales :
 - statut ;
 - règle appliquée.
 
+Le mois budgétaire affiché est toujours la période effective. Sa provenance
+courante doit être explicable sans présenter cette information comme un
+historique complet.
+
 Filtres :
 
 - compte ;
@@ -717,6 +809,13 @@ Filtres :
 - réel/prévu ;
 - inclus/hors budget ;
 - à valider.
+
+Le filtre et le tri par mois budgétaire utilisent la période effective. Ils ne
+peuvent pas ignorer une correction manuelle au profit d'une affectation par
+règle.
+
+L'utilisateur peut créer, modifier ou supprimer une correction manuelle. Une
+action distincte permet de réinitialiser complètement l'affectation de période.
 
 ### 10.3 Budget mensuel
 
@@ -728,6 +827,9 @@ Vue par poste :
 - prévision fin de mois ;
 - écart.
 
+Les montants réels et les agrégations mensuelles utilisent la période
+budgétaire effective.
+
 ### 10.4 Prévision 12 mois
 
 Tableau :
@@ -736,6 +838,9 @@ Tableau :
 | ---- | ----------: | ------: | ----: | --------: | --------: | --------: |
 
 La sélection d'un mois ouvre le détail des opérations qui construisent la prévision.
+
+Les prévisions budgétaires mensuelles utilisent la période effective. Les
+soldes bancaires et la trésorerie conservent la date bancaire.
 
 ### 10.5 Règles
 
@@ -746,7 +851,11 @@ Permet :
 - activer ;
 - désactiver ;
 - réordonner ;
+- prévisualiser puis demander une réévaluation explicite ;
 - voir l'historique d'exécution.
+
+La présentation d'une affectation par règle masquée par une correction manuelle
+reste à concevoir avant la mise à disposition de la fonctionnalité.
 
 ### 10.6 Hypothèses et scénarios
 
@@ -769,11 +878,21 @@ Une charge de fin août configurée comme appartenant au cycle de septembre appa
 
 ### AC-003
 
-La désactivation de cette règle réaffecte correctement les opérations concernées selon la règle suivante disponible.
+Étant donné une transaction de salaire datée du 28/08/2026 et une affectation
+existante à septembre 2026 produite par la règle M+1 utilisée dans AC-001, qui
+affecte les salaires reçus en fin de mois au budget du mois suivant :
+
+- la désactivation de cette règle ne modifie pas rétroactivement l'affectation
+  existante ;
+- `budgetPeriod` reste égal à `2026-09` ;
+- seule une réévaluation explicitement demandée peut remplacer ou retirer
+  l'affectation par règle ;
+- cette réévaluation ne modifie aucune correction manuelle éventuelle.
 
 ### AC-004
 
-Une correction manuelle de mois budgétaire n'est pas écrasée par un nouvel import.
+Une correction manuelle de mois budgétaire n'est écrasée ni par un import, ni
+par un réimport, ni par une nouvelle affectation produite par une règle.
 
 ### AC-005
 
@@ -823,6 +942,39 @@ Le système affiche séparément :
 
 Aucun appel à un LLM n'est nécessaire pour obtenir les résultats financiers du MVP.
 
+### AC-016
+
+Supprimer une correction manuelle révèle la dernière affectation par règle. Si
+aucune règle n'a affecté l'opération, le mois budgétaire redevient le mois de la
+date bancaire.
+
+### AC-017
+
+Une réévaluation explicite peut remplacer ou retirer l'affectation par règle,
+mais conserve toute correction manuelle existante.
+
+### AC-018
+
+Une réinitialisation complète sans action concurrente plus récente ramène la
+période budgétaire au mois de la date bancaire. Des états intermédiaires peuvent
+être visibles entre appareils, mais les appareils compatibles convergent vers
+le même résultat final.
+
+### AC-019
+
+Pour une même opération, la projection effective détermine la même période
+budgétaire pour :
+
+- l'affichage ;
+- les filtres ;
+- les tris ;
+- les budgets ;
+- les agrégations ;
+- l'API ;
+- les exports ;
+- les règles ;
+- les prévisions budgétaires.
+
 ---
 
 ## 12. Exigences non fonctionnelles
@@ -861,6 +1013,10 @@ L'utilisateur doit pouvoir exporter :
 - budgets ;
 - hypothèses ;
 - prévisions.
+
+La période budgétaire exportée est la période effective. Sa provenance
+courante est dérivée de la correction manuelle, de l'affectation par règle ou
+du mois bancaire ; elle ne doit pas être présentée comme un historique.
 
 ### NFR-006 — Réversibilité
 
@@ -912,9 +1068,22 @@ La migration ne doit pas être une réécriture automatique complète du code Ty
 
 ### Phase 1 — Extension fonctionnelle
 
-Ajouter d'abord le concept de `budgetPeriod` distinct de `bankDate`.
+Introduire `budgetPeriod` comme période effective distincte de `bankDate`, à
+partir d'une correction manuelle, d'une affectation par règle ou du mois
+bancaire.
 
 Valider les cas métier français sur le frontend existant.
+
+Le statut de livraison applicable à cette phase est :
+
+- ADR-0006 : **ACCEPTÉE** ;
+- Architecture option D :
+  **READY FOR EXPERIMENTAL / TEST-FIRST IMPLEMENTATION** ;
+- Migration, activation et livraison en production :
+  **NOT READY FOR PRODUCTION MIGRATION OR RELEASE**.
+
+Ce statut de livraison est temporaire, distinct des exigences fonctionnelles et
+ne constitue pas une exigence produit permanente.
 
 ### Phase 2 — Budget engine Java
 
@@ -1027,14 +1196,25 @@ Après le MVP :
 
 ### EPIC 1 — Introduire `budgetPeriod`
 
-1. ajouter le champ au modèle ;
-2. migration des données existantes ;
-3. valeur par défaut à partir de la date bancaire ;
-4. affichage dans les transactions ;
-5. édition manuelle ;
-6. filtres ;
-7. tests ;
-8. audit de modification.
+1. écrire d'abord les tests des cas mois bancaire, affectation par règle et
+   correction manuelle ;
+2. définir le modèle conceptuel en couches ;
+3. centraliser le calcul de la période effective ;
+4. afficher et filtrer les transactions par période effective ;
+5. créer, modifier et supprimer une correction manuelle ;
+6. réinitialiser séparément la correction manuelle ou l'affectation complète ;
+7. appliquer la même projection aux budgets, prévisions, API et exports ;
+8. tester la convergence entre appareils et les états intermédiaires ;
+9. respecter le statut de livraison suivant :
+
+   - ADR-0006 : **ACCEPTÉE** ;
+   - Architecture option D :
+     **READY FOR EXPERIMENTAL / TEST-FIRST IMPLEMENTATION** ;
+   - Migration, activation et livraison en production :
+     **NOT READY FOR PRODUCTION MIGRATION OR RELEASE**.
+
+   Ce statut de livraison est temporaire, distinct des exigences fonctionnelles
+   et ne constitue pas une exigence produit permanente.
 
 ### EPIC 2 — Règle M+1
 
@@ -1043,7 +1223,9 @@ Après le MVP :
 3. condition par libellé ;
 4. priorité ;
 5. test sur historique ;
-6. visualisation de la règle appliquée.
+6. visualisation de la règle appliquée ;
+7. réévaluation explicite limitée à l'affectation par règle ;
+8. désactivation sans réécriture rétroactive.
 
 ### EPIC 3 — Forecast déterministe
 
