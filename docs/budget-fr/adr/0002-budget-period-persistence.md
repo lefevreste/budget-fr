@@ -1,6 +1,13 @@
 # ADR-0002 — Persistance de la période budgétaire
 
-- Statut : Acceptée
+- Statut : Supersédée
+- Supersédée par :
+  [ADR-0006 — Affectation de période budgétaire en couches](./0006-layered-budget-period-assignment.md)
+- Portée de la supersession : ADR-0006 remplace la décision de persistance, les
+  invariants et sémantiques d'affectation qui en dépendent, les politiques
+  Rule/Manual/Default et les comportements splits/transferts précédemment
+  décidés. ADR-0002 reste consultable comme historique et n'est plus normative
+  pour ces sujets.
 - Date : 2026-09-01
 - Décideurs : équipe Budget FR
 - Portée : MVP Budget FR dans Actual Budget
