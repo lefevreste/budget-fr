@@ -4,7 +4,17 @@
 **Date :** 01/09/2026
 **Statut :** architecture de cadrage
 **Base :** fork de `actualbudget/actual`
-**Document fonctionnel associé :** `functional-spec-budget-fr-v0.1.md`
+**Document fonctionnel associé :** [spécification fonctionnelle](./functional-spec.md)
+
+---
+
+## Références de décision
+
+- [ADR-0006 — Affectation de période budgétaire en couches](./adr/0006-layered-budget-period-assignment.md)
+- [Premier POC de concurrence CRDT](./spikes/budget-period-crdt.md)
+- [POC CRDT de l'option D](./spikes/budget-period-option-d.md)
+- [ADR-0002 — Persistance de la période budgétaire](./adr/0002-budget-period-persistence.md),
+  conservée comme historique et non normative pour les sujets supersédés
 
 ---
 
@@ -109,27 +119,20 @@ budgetPeriod = 2026-09
 
 La date bancaire ne doit jamais être modifiée pour obtenir un résultat budgétaire.
 
-### ARCH-003 — Ne pas choisir la persistance de `budgetPeriod` à l'aveugle
+### ARCH-003 — Affectation budgétaire en couches
 
-Avant toute migration SQL, Codex doit analyser :
+[ADR-0006](./adr/0006-layered-budget-period-assignment.md) remplace la décision
+à trois colonnes d'ADR-0002. L'affectation repose sur deux cellules
+transaction-locales indépendantes : une correction Manual nullable et un
+composite Rule nullable. La source et `budgetPeriod` sont dérivés et ne sont
+jamais persistés.
 
-- la table transaction réelle ;
-- les vues `v_*` ;
-- les migrations ;
-- la couche de synchronisation ;
-- le modèle CRDT ;
-- les types ;
-- l'API transaction ;
-- les règles ;
-- les imports.
+La priorité `Manual > Rule > Default` est une règle de domaine appliquée par
+une projection centralisée. Elle n'est pas fournie par le CRDT.
 
-À l'issue de cette analyse, une ADR choisira entre :
-
-1. champ supplémentaire dans une structure existante ;
-2. table d'extension synchronisée ;
-3. autre mécanisme compatible avec l'architecture Actual.
-
-Aucun choix de stockage n'est autorisé avant ce diagnostic.
+Cette décision autorise l'implémentation expérimentale écrite par les tests.
+Elle n'autorise encore aucune migration de données utilisateur, activation ou
+release.
 
 ### ARCH-004 — Le calcul financier est déterministe
 
@@ -205,8 +208,10 @@ Objectif : introduire la séparation entre date bancaire et mois budgétaire.
 
 Fonctions :
 
-- `budgetPeriod` ;
-- valeur par défaut = mois de `bankDate` ;
+- correction Manual nullable ;
+- affectation Rule composite nullable ;
+- `budgetPeriod` et source calculés par projection effective ;
+- valeur Default dérivée du mois de `bankDate` ;
 - affichage ;
 - modification manuelle ;
 - filtre ;
@@ -214,6 +219,11 @@ Fonctions :
 - traçabilité ;
 - règles d'affectation ;
 - action M+1.
+
+Tous les consommateurs d'une période budgétaire doivent utiliser la même
+projection centralisée : budgets, filtres, tris, agrégations, API, UI, exports,
+règles et prévisions budgétaires. Les soldes bancaires, la trésorerie et le
+forecast journalier continuent d'utiliser `bankDate`.
 
 Le premier cas de test structurant est :
 
@@ -224,6 +234,13 @@ SALAIRE reçu le 28/08
 ```
 
 À ce stade, tout reste TypeScript / SQLite / architecture Actual.
+
+La phase autorise les tests de production écrits d'abord, la projection
+centralisée, le validateur et l'encodeur JSON, les prototypes de migration sur
+fixtures, le traitement expérimental des messages invalides ainsi que les tests
+réels de synchronisation, de splits, de transferts et de compatibilité. Elle
+n'autorise aucune migration de données utilisateur, activation, diffusion à des
+clients ou mise en production.
 
 ---
 
@@ -458,7 +475,8 @@ actual/
 │       ├── domain-model.md
 │       └── adr/
 │           ├── 0001-budget-period-concept.md
-│           └── 0002-budget-period-persistence.md
+│           ├── 0002-budget-period-persistence.md # historique supersédé
+│           └── 0006-layered-budget-period-assignment.md
 └── budget-fr-java/                 # créé seulement en phase 4
     ├── pom.xml / build.gradle
     └── src/
@@ -561,16 +579,112 @@ Interprétation budgétaire :
 
 ```text
 transactionId
+manualBudgetPeriod
+ruleAssignment { period, ruleId }
 budgetPeriod
+budgetPeriodSource
 categoryId
 nature
 includedInBudget
-ruleId
-source
-manualOverride
 ```
 
-La séparation logique BankTransaction / BudgetAssignment est un invariant de conception, même si l'implémentation physique dans Actual peut être différente pendant la phase 1.
+Le modèle conceptuel utilise camelCase. `manualBudgetPeriod` et
+`ruleAssignment` sont les deux couches d'affectation ; `budgetPeriod` et
+`budgetPeriodSource` sont des projections dérivées.
+
+Le mapping vers le modèle interne Actual est :
+
+| Concept métier       | Interne Actual                                        | Persistance                |
+| -------------------- | ----------------------------------------------------- | -------------------------- |
+| `bankDate`           | `date`                                                | existante, date bancaire   |
+| `manualBudgetPeriod` | `manual_budget_period`                                | cellule nullable           |
+| `ruleAssignment`     | `rule_assignment`                                     | cellule composite nullable |
+| `budgetPeriod`       | aucune colonne ; projection `effectiveBudgetPeriod`   | jamais persistée           |
+| `budgetPeriodSource` | aucune colonne ; source `manual`, `rule` ou `default` | jamais persistée           |
+
+La séparation logique BankTransaction / BudgetAssignment est un invariant de
+conception, même si les deux cellules sont physiquement portées par la
+transaction Actual pendant la phase 1.
+
+### Projection effective
+
+```text
+effectiveBudgetPeriod =
+  manual_budget_period
+  sinon rule_assignment.period
+  sinon month(date)
+```
+
+Le CRDT résout le conflit interne à chaque cellule, mais n'applique pas la
+priorité métier. Aucun consommateur ne peut lire `rule_assignment.period` comme
+période effective sans vérifier `manual_budget_period`.
+
+### SQLite, AQL et JSON canonique
+
+| Colonne interne        | SQLite         | AQL          | Rôle                                |
+| ---------------------- | -------------- | ------------ | ----------------------------------- |
+| `manual_budget_period` | `INTEGER NULL` | `date-month` | correction Manual                   |
+| `rule_assignment`      | `TEXT NULL`    | `json`       | composite Rule `{ period, ruleId }` |
+
+L'encodage canonique exact de `rule_assignment` est :
+
+```text
+{"period":"2024-10","ruleId":"rule-1"}
+```
+
+L'ordre `period`, puis `ruleId`, l'absence d'espace et l'absence de clé
+supplémentaire sont une décision d'encodage Budget FR. Ce comportement n'est
+garanti ni par JSON, ni par SQLite, ni par le CRDT, ni par le type AQL `json`.
+Un encodeur et un validateur métier centralisés sont donc obligatoires.
+
+Une valeur synchronisée invalide ne devient jamais silencieusement Default. La
+frontière de détection et la politique de rejet, quarantaine, récupération et
+resynchronisation restent à décider avant toute migration ou activation.
+
+La migration envisagée reste additive et nullable, sans backfill ni index
+initial. Les anciennes transactions restent Default par projection. Aucun
+numéro ou patch de migration n'est défini ici, et aucune modification de
+`SYNC_FORMAT_VERSION` n'est autorisée par cette décision.
+
+### Synchronisation et cycle de vie
+
+`manual_budget_period` et `rule_assignment` sont deux cellules CRDT LWW
+indépendantes. Le composite Rule est indivisible : `period` et `ruleId` gagnent,
+sont rejoués ou sont supprimés ensemble.
+
+Une règle, un import ou un réimport ne peut écrire que `rule_assignment` et ne
+touche jamais `manual_budget_period`. Supprimer Manual révèle la dernière Rule,
+sinon Default. La suppression ou la désactivation d'une règle ne modifie pas
+rétroactivement les snapshots Rule existants ; une réévaluation explicite peut
+remplacer ou effacer uniquement `rule_assignment`.
+
+Le reset complet écrit :
+
+```text
+manual_budget_period = null
+rule_assignment = null
+```
+
+`batchMessages` rend ces deux écritures atomiques dans la transaction SQLite
+locale. Le protocole ne conserve toutefois aucune frontière de batch durable
+entre appareils : des états intermédiaires sont acceptés et la convergence
+finale est déterminée séparément par le gagnant LWW de chaque cellule. Une
+écriture concurrente plus récente peut survivre au reset dans sa cellule.
+
+Les plans de livraison des POC sont représentatifs, pas exhaustifs. La matrice
+mixte par cellule et l'égalité HULC départagée par `node` restent à tester. Les
+clients partageant un budget doivent connaître les deux colonnes ; la stratégie
+de clients mixtes reste un gate.
+
+`messages_crdt` conserve l'état technique nécessaire à la convergence. Il ne
+constitue jamais un journal d'audit métier.
+
+### Splits et transferts
+
+L'option D garantit la cohérence d'une affectation sur une ligne, mais ne rend
+pas atomique un split ou les deux côtés d'un transfert. Les vrais workflows
+Actual et la politique de propagation/récupération multi-lignes restent un gate
+distinct. Cette architecture ne les résout pas.
 
 ---
 
@@ -611,6 +725,12 @@ POST   /api/v1/scenarios
 POST   /api/v1/scenarios/{id}/forecast
 ```
 
+Tout contrat transaction exposant une période budgétaire doit retourner
+`budgetPeriod` depuis la projection centralisée et une source dérivée. Il ne
+doit jamais exposer `rule_assignment.period` comme période effective sans
+appliquer la priorité Manual. Les opérations de correction Manual, de
+réévaluation Rule et de reset doivent rester distinctes.
+
 Cette API ne doit pas être créée tant qu'un besoin concret ne l'exige pas.
 
 ---
@@ -631,7 +751,10 @@ Exigences minimales :
 - dépendances analysées ;
 - authentification avant exposition réseau d'un backend ;
 - contrôle d'accès au niveau du foyer ;
-- audit des mutations critiques.
+- audit des mutations critiques ;
+- validation stricte des affectations Rule produites localement ;
+- état d'erreur explicite pour une affectation synchronisée invalide, sans
+  conversion silencieuse vers Default.
 
 Lors de l'introduction de l'IA :
 
@@ -663,9 +786,26 @@ Cas minimaux :
 
 - salaire M+1 ;
 - charge M+1 ;
-- correction manuelle ;
-- règle prioritaire ;
-- transfert interne ;
+- Default sans valeur persistée ;
+- Rule seule ;
+- Manual masquant Rule ;
+- suppression Manual révélant Rule ;
+- deux Rule concurrentes sans mélange du composite ;
+- deux Manual concurrentes ;
+- suppression Rule ;
+- reset complet et resets concurrents ;
+- rejeu idempotent ;
+- désactivation de règle sans réécriture rétroactive ;
+- réévaluation limitée à Rule ;
+- JSON invalide local et synchronisé ;
+- projection identique pour budgets, filtres, tris, agrégations, API, UI,
+  exports, règles et prévisions budgétaires ;
+- livraison inverse dans une cellule et directe dans l'autre ;
+- égalité HULC départagée par `node` ;
+- clients de versions différentes ;
+- migration sur fixtures, ouverture, réouverture, backup et restauration ;
+- vrais workflows de splits et transferts, sans présumer leur résolution ;
+- transfert interne exclu du résultat consolidé ;
 - hors budget ;
 - rapprochement prévu/réel ;
 - dépense en N fois ;
@@ -763,11 +903,15 @@ Statut : accepté.
 
 ### ADR-0002 — Persistance de `budgetPeriod`
 
-Statut : à décider après analyse du fork.
+Statut : supersédée par
+[ADR-0006](./adr/0006-layered-budget-period-assignment.md). Elle reste
+consultable comme historique, mais n'est plus normative pour la persistance,
+les invariants et sémantiques d'affectation, les politiques
+Rule/Manual/Default ou les comportements splits/transferts remplacés.
 
 ### ADR-0003 — Format monétaire du contrat Java
 
-Statut : futur.
+Statut : futur. Numéro réservé à cette décision.
 
 ### ADR-0004 — Mode d'exécution Java
 
@@ -777,11 +921,17 @@ Options futures :
 - service self-hosted ;
 - autre.
 
-Statut : futur.
+Statut : futur. Numéro réservé à cette décision.
 
 ### ADR-0005 — Fournisseur Open Banking
 
-Statut : futur.
+Statut : futur. Numéro réservé à cette décision.
+
+### ADR-0006 — Affectation de période budgétaire en couches
+
+Statut : acceptée. Elle décide les deux cellules CRDT indépendantes, le
+composite Rule JSON canonique, la projection normative
+`Manual > Rule > Default` et les gates de préparation à l'implémentation.
 
 ---
 
@@ -802,11 +952,12 @@ Une évolution n'est terminée que si :
 
 ---
 
-## 16. Première étape Codex
+## 16. Première étape Codex — historique accompli
 
-Le premier travail dans VSCodium est **un diagnostic sans modification fonctionnelle**.
+La première analyse Codex a été réalisée comme un diagnostic sans modification
+fonctionnelle.
 
-Codex devra produire :
+Elle a produit :
 
 ```text
 docs/budget-fr/actual-baseline.md
@@ -824,23 +975,60 @@ avec :
 - synchronisation ;
 - UI de transaction ;
 - API ;
-- options de persistance pour `budgetPeriod` ;
+- options de persistance alors envisagées pour `budgetPeriod` ;
 - recommandation argumentée ;
 - liste exacte des fichiers qui seraient touchés par la première feature.
 
-Aucun code métier n'est autorisé pendant ce premier diagnostic.
+Aucun code métier n'a été ajouté pendant ce premier diagnostic. Cette section
+est conservée comme historique du cadrage initial.
 
 ---
 
 ## 17. Gate de passage au développement
 
-Nous pouvons commencer `feat/budget-period` uniquement lorsque :
+### ADR-0006
 
-- Actual démarre localement ;
-- les tests de baseline sont connus ;
-- le diagnostic est écrit ;
-- la persistance de `budgetPeriod` est décidée ;
-- les risques de synchronisation sont compris ;
-- les critères de recette AC-001 à AC-005 sont transformés en tests.
+**ACCEPTÉE** — la persistance en deux cellules indépendantes, le composite Rule
+indivisible, la source dérivée et la projection effective normative remplacent
+ADR-0002 pour la persistance et toutes les sémantiques d'affectation qui en
+dépendent.
 
-C'est à ce moment seulement que commence le premier développement fonctionnel.
+### Architecture option D
+
+**READY FOR EXPERIMENTAL / TEST-FIRST IMPLEMENTATION** — l'implémentation
+expérimentale autorisée peut inclure :
+
+- des tests de production écrits d'abord ;
+- la projection effective centralisée ;
+- le validateur et l'encodeur JSON ;
+- des prototypes de migration sur fixtures ;
+- le traitement expérimental des messages invalides ;
+- les tests réels des splits et transferts ;
+- les tests de compatibilité.
+
+Elle n'autorise pas :
+
+- la migration de données utilisateur ;
+- l'activation de la fonctionnalité ;
+- la diffusion à des clients ;
+- le déploiement en production.
+
+### Migration, activation et livraison en production
+
+**NOT READY FOR PRODUCTION MIGRATION OR RELEASE** — restent bloquants :
+
+- la validation et la récupération des JSON synchronisés invalides ;
+- la matrice CRDT élargie et l'égalité HULC départagée par `node` ;
+- le contrat centralisé `effectiveBudgetPeriod` et les tests de tous les
+  consommateurs ;
+- la stratégie de compatibilité des clients de versions différentes ;
+- la conception et la validation de la migration réelle ;
+- les splits et transferts multi-lignes.
+
+Le contrat API/UI expliquant un snapshot Rule lié à une règle supprimée et la
+pertinence d'un éventuel index d'expression restent également à définir ou à
+mesurer avant production.
+
+Le réalignement d'`architecture.md` et de `functional-spec.md` sera considéré
+comme levé après validation du présent changement. Il ne lève aucun des autres
+gates et n'autorise ni migration, ni activation, ni release.
