@@ -2,6 +2,30 @@
 
 This guide provides comprehensive information for AI agents (like Cursor) working with the Actual Budget codebase.
 
+## Repository Instruction Routing
+
+This file is the general baseline for every task in this repository. Before
+acting, read and apply the additional documents that match the task. Their
+instructions are cumulative with this file:
+
+- For shell commands and token-efficient output handling, read
+  [`RTK.md`](./RTK.md).
+- For any Budget FR analysis, documentation, implementation, migration,
+  synchronization, or validation work, read
+  [`AGENTS-budget-fr.md`](./AGENTS-budget-fr.md) and the applicable normative
+  documents it identifies.
+- For UI design, restyling, or visual review work, read
+  [`PRODUCT.md`](./PRODUCT.md) and [`DESIGN.md`](./DESIGN.md), then follow the
+  Impeccable skill instructions in the UI Design section below.
+- For code reviews, read
+  [`CODE_REVIEW_GUIDELINES.md`](./CODE_REVIEW_GUIDELINES.md).
+- For commits, pull requests, or GitHub interactions, read
+  [`.github/agents/pr-and-commit-rules.md`](./.github/agents/pr-and-commit-rules.md).
+
+If an additional document does not apply to the current task, do not load it
+only for completeness. If instructions conflict, preserve security and data
+integrity first, then follow the more specific applicable project instruction.
+
 ## Project Overview
 
 **Actual Budget** is a local-first personal finance tool written in TypeScript/JavaScript. It's 100% free and open-source with synchronization capabilities across devices.
