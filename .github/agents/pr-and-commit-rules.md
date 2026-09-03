@@ -22,7 +22,7 @@ yourself.
   who tested the change fills in the Description, Related issue(s), Testing, and
   Checklist sections.
 - **Exception**: if a human **explicitly asks** you to fill it out, do so **in
-  Chinese**, using Chinese characters (简体中文) for all content you add.
+  French**, unless the human explicitly requests another language.
 
 ## Do not create GitHub issues
 
