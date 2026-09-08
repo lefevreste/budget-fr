@@ -1,4 +1,4 @@
-import { Timestamp } from '@actual-app/crdt';
+import { getClock, Timestamp } from '@actual-app/crdt';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { SchemaConfig } from '#server/aql/compiler';
@@ -12,6 +12,7 @@ import { q } from '#shared/query';
 import {
   applyMessages,
   batchMessages,
+  receiveMessages,
   sendMessages,
   setSyncingMode,
 } from './index';
@@ -28,6 +29,8 @@ const RULE_CLIENT = 'RULE000000000001';
 const MANUAL_CLIENT = 'MANUAL0000000001';
 const RESET_CLIENT = 'RESET00000000001';
 const SECOND_CLIENT = 'SECOND0000000001';
+const LOW_NODE = 'a';
+const HIGH_NODE = 'z';
 
 const JSON_RULE_PERIOD_SQL =
   "CAST(REPLACE(json_extract(rule_assignment, '$.period'), '-', '') AS INTEGER)";
@@ -55,6 +58,31 @@ type EffectiveState = {
   source: DerivedSource;
   effectiveBudgetPeriod: number;
 };
+
+type PersistedMessage = Pick<
+  db.DbCrdtMessage,
+  'dataset' | 'row' | 'column' | 'timestamp' | 'value'
+>;
+
+type DeliveredMessage = Pick<
+  Message,
+  'dataset' | 'row' | 'column' | 'value'
+> & {
+  timestamp: string;
+  old: boolean;
+};
+
+type ExpectedProbeState = Readonly<{
+  manualBudgetPeriod: number | null;
+  encodedRuleAssignment: string | null;
+  effectiveState: EffectiveState;
+  winningManualTimestamp: string | null;
+  winningRuleTimestamp: string | null;
+}>;
+
+type DeliveryPlan = readonly (readonly Message[])[];
+
+type MessageReceiver = (messages: Message[]) => Promise<Message[] | undefined>;
 
 type RuleEncoding = {
   name: 'json' | 'text';
@@ -241,6 +269,10 @@ function hulc(offset: number, node: string): Timestamp {
   return new Timestamp(BASE_TIME + offset, 0, node);
 }
 
+function tiedHulc(offset: number, counter: number, node: string): Timestamp {
+  return new Timestamp(BASE_TIME + offset, counter, node);
+}
+
 function nextHulc(): Timestamp {
   const timestamp = Timestamp.send();
   if (timestamp === null) {
@@ -298,6 +330,10 @@ function ruleMessage(
     offset,
     node,
   );
+}
+
+function withTimestamp(message: Message, timestamp: Timestamp): Message {
+  return { ...message, timestamp };
 }
 
 function externalRuleMessage(
@@ -383,13 +419,93 @@ function expectedState(
 async function readPersistedMessages(
   encoding: RuleEncoding,
   row = ROW_ID,
-): Promise<Array<Pick<db.DbCrdtMessage, 'column' | 'timestamp' | 'value'>>> {
-  return db.all<Pick<db.DbCrdtMessage, 'column' | 'timestamp' | 'value'>>(
-    `SELECT column, timestamp, value
+): Promise<PersistedMessage[]> {
+  return db.all<PersistedMessage>(
+    `SELECT dataset, row, column, timestamp, value
      FROM messages_crdt
      WHERE dataset = ? AND row = ?
-     ORDER BY timestamp`,
+     ORDER BY dataset, row, column, timestamp`,
     [encoding.dataset, row],
+  );
+}
+
+function indexDeliveredMessages(
+  messages: readonly Message[],
+): Record<string, DeliveredMessage> {
+  return Object.fromEntries(
+    messages.map(message => [
+      message.timestamp.toString(),
+      {
+        dataset: message.dataset,
+        row: message.row,
+        column: message.column,
+        value: message.value,
+        timestamp: message.timestamp.toString(),
+        old: message.old === true,
+      },
+    ]),
+  );
+}
+
+async function readWinningTimestamp(
+  encoding: RuleEncoding,
+  column: 'manual_budget_period' | 'rule_assignment',
+  row = ROW_ID,
+): Promise<string | null> {
+  const result = await db.first<{ timestamp: string }>(
+    `SELECT timestamp
+     FROM messages_crdt
+     WHERE dataset = ? AND row = ? AND column = ?
+     ORDER BY timestamp DESC
+     LIMIT 1`,
+    [encoding.dataset, row, column],
+  );
+  return result?.timestamp ?? null;
+}
+
+function permutations<T>(values: readonly T[]): T[][] {
+  if (values.length === 0) {
+    return [[]];
+  }
+
+  return values.flatMap((value, index) => {
+    const remaining = [...values.slice(0, index), ...values.slice(index + 1)];
+    return permutations(remaining).map(permutation => [value, ...permutation]);
+  });
+}
+
+function singletonPlan(messages: readonly Message[]): DeliveryPlan {
+  return messages.map(message => [message]);
+}
+
+async function deliver(
+  plan: DeliveryPlan,
+  receiver: MessageReceiver = applyMessages,
+): Promise<Message[]> {
+  const results: Message[] = [];
+  for (const chunk of plan) {
+    results.push(...((await receiver([...chunk])) ?? []));
+  }
+  return results;
+}
+
+async function expectExplicitProbeState(
+  encoding: RuleEncoding,
+  expected: ExpectedProbeState,
+): Promise<void> {
+  expect(await readProbeRow(encoding)).toEqual({
+    id: ROW_ID,
+    date: 20240915,
+    amount: 0,
+    manual_budget_period: expected.manualBudgetPeriod,
+    rule_assignment: expected.encodedRuleAssignment,
+  });
+  expect(await readEffectiveState(encoding)).toEqual(expected.effectiveState);
+  expect(await readWinningTimestamp(encoding, 'manual_budget_period')).toBe(
+    expected.winningManualTimestamp,
+  );
+  expect(await readWinningTimestamp(encoding, 'rule_assignment')).toBe(
+    expected.winningRuleTimestamp,
   );
 }
 
@@ -754,6 +870,642 @@ describe('Budget period option D CRDT spike', () => {
         );
       },
     );
+  });
+
+  describe('convergence closure matrix', () => {
+    it.each(ENCODINGS)(
+      'C01 exhausts the 24 singleton permutations for $name',
+      async encoding => {
+        const ruleOne = ruleMessage(encoding, RULE_ONE, 1_000);
+        const manualOne = manualMessage(encoding, 202410, 2_000);
+        const ruleTwo = ruleMessage(encoding, RULE_TWO, 3_000, SECOND_CLIENT);
+        const manualTwo = manualMessage(encoding, 202411, 4_000, SECOND_CLIENT);
+        const plans = permutations([
+          ruleOne,
+          manualOne,
+          ruleTwo,
+          manualTwo,
+        ]).map(singletonPlan);
+        const signatures = plans.map(plan =>
+          plan
+            .flatMap(chunk => chunk)
+            .map(message => message.timestamp.toString())
+            .join('|'),
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: manualTwo.timestamp.toString(),
+          winningRuleTimestamp: ruleTwo.timestamp.toString(),
+        };
+        let referenceMessages: PersistedMessage[] | undefined;
+
+        expect(plans.length).toBe(24);
+        expect(new Set(signatures).size).toBe(24);
+        for (const plan of plans) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+
+          const persisted = await readPersistedMessages(encoding);
+          expect(persisted).toHaveLength(4);
+          if (referenceMessages === undefined) {
+            referenceMessages = persisted;
+          } else {
+            expect(persisted).toEqual(referenceMessages);
+          }
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C02-C03 converges when Rule and Manual use opposite delivery orders for $name',
+      async encoding => {
+        const ruleOne = ruleMessage(encoding, RULE_ONE, 5_000);
+        const manualOne = manualMessage(encoding, 202410, 6_000);
+        const manualTwo = manualMessage(encoding, 202411, 7_000, SECOND_CLIENT);
+        const ruleTwo = ruleMessage(encoding, RULE_TWO, 8_000, SECOND_CLIENT);
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: manualTwo.timestamp.toString(),
+          winningRuleTimestamp: ruleTwo.timestamp.toString(),
+        };
+        const oppositePlans: DeliveryPlan[] = [
+          [[ruleOne], [ruleTwo], [manualTwo], [manualOne]],
+          [[ruleTwo], [ruleOne], [manualOne], [manualTwo]],
+        ];
+        const observations: Array<{
+          persisted: PersistedMessage[];
+          delivered: Record<string, DeliveredMessage>;
+        }> = [];
+
+        for (const plan of oppositePlans) {
+          await resetProbeDatabase();
+          const delivered = await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+          const persisted = await readPersistedMessages(encoding);
+          expect(persisted).toHaveLength(4);
+
+          observations.push({
+            persisted,
+            delivered: indexDeliveredMessages(delivered),
+          });
+        }
+
+        expect(observations).toHaveLength(2);
+        expect(observations[1].persisted).toEqual(observations[0].persisted);
+        expect(observations[0].delivered).toEqual(
+          indexDeliveredMessages([
+            ruleOne,
+            ruleTwo,
+            manualTwo,
+            { ...manualOne, old: true },
+          ]),
+        );
+        expect(observations[1].delivered).toEqual(
+          indexDeliveredMessages([
+            ruleTwo,
+            { ...ruleOne, old: true },
+            manualOne,
+            manualTwo,
+          ]),
+        );
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C04 lets the normalized lexically greater node win a Manual tie for $name',
+      async encoding => {
+        const lowTimestamp = tiedHulc(10_000, 7, LOW_NODE);
+        const highTimestamp = tiedHulc(10_000, 7, HIGH_NODE);
+        const lowManual = withTimestamp(
+          manualMessage(encoding, 202410, 10_000, LOW_NODE),
+          lowTimestamp,
+        );
+        const highManual = withTimestamp(
+          manualMessage(encoding, 202412, 10_000, HIGH_NODE),
+          highTimestamp,
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202412,
+          encodedRuleAssignment: null,
+          effectiveState: {
+            manualBudgetPeriod: 202412,
+            ruleAssignment: null,
+            source: 'manual',
+            effectiveBudgetPeriod: 202412,
+          },
+          winningManualTimestamp: highTimestamp.toString(),
+          winningRuleTimestamp: null,
+        };
+
+        expect(lowTimestamp.toString()).toBe(
+          '2020-01-01T00:00:10.000Z-0007-000000000000000a',
+        );
+        expect(highTimestamp.toString()).toBe(
+          '2020-01-01T00:00:10.000Z-0007-000000000000000z',
+        );
+        expect(lowTimestamp.toString() < highTimestamp.toString()).toBe(true);
+
+        for (const plan of [
+          singletonPlan([lowManual, highManual]),
+          singletonPlan([highManual, lowManual]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C05-C06 applies the node tie-break equally to Manual values and null for $name',
+      async encoding => {
+        const valueWinsTimestamp = tiedHulc(11_000, 8, HIGH_NODE);
+        const losingNullTimestamp = tiedHulc(11_000, 8, LOW_NODE);
+        const valueWins = withTimestamp(
+          manualMessage(encoding, 202411, 11_000, HIGH_NODE),
+          valueWinsTimestamp,
+        );
+        const nullLoses = withTimestamp(
+          manualMessage(encoding, null, 11_000, LOW_NODE),
+          losingNullTimestamp,
+        );
+        const valueExpected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: null,
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: null,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: valueWinsTimestamp.toString(),
+          winningRuleTimestamp: null,
+        };
+
+        for (const plan of [
+          singletonPlan([valueWins, nullLoses]),
+          singletonPlan([nullLoses, valueWins]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, valueExpected);
+        }
+
+        const losingValueTimestamp = tiedHulc(12_000, 9, LOW_NODE);
+        const nullWinsTimestamp = tiedHulc(12_000, 9, HIGH_NODE);
+        const valueLoses = withTimestamp(
+          manualMessage(encoding, 202411, 12_000, LOW_NODE),
+          losingValueTimestamp,
+        );
+        const nullWins = withTimestamp(
+          manualMessage(encoding, null, 12_000, HIGH_NODE),
+          nullWinsTimestamp,
+        );
+        const nullExpected: ExpectedProbeState = {
+          manualBudgetPeriod: null,
+          encodedRuleAssignment: null,
+          effectiveState: {
+            manualBudgetPeriod: null,
+            ruleAssignment: null,
+            source: 'default',
+            effectiveBudgetPeriod: 202409,
+          },
+          winningManualTimestamp: nullWinsTimestamp.toString(),
+          winningRuleTimestamp: null,
+        };
+
+        for (const plan of [
+          singletonPlan([valueLoses, nullWins]),
+          singletonPlan([nullWins, valueLoses]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, nullExpected);
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C07 keeps the complete Rule composite from the greater node for $name',
+      async encoding => {
+        const lowTimestamp = tiedHulc(13_000, 10, LOW_NODE);
+        const highTimestamp = tiedHulc(13_000, 10, HIGH_NODE);
+        const lowRule = withTimestamp(
+          ruleMessage(encoding, RULE_ONE, 13_000, LOW_NODE),
+          lowTimestamp,
+        );
+        const highRule = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 13_000, HIGH_NODE),
+          highTimestamp,
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: null,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: null,
+            ruleAssignment: RULE_TWO,
+            source: 'rule',
+            effectiveBudgetPeriod: 202412,
+          },
+          winningManualTimestamp: null,
+          winningRuleTimestamp: highTimestamp.toString(),
+        };
+
+        for (const plan of [
+          singletonPlan([lowRule, highRule]),
+          singletonPlan([highRule, lowRule]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+          expect((await readProbeRow(encoding))?.rule_assignment).toBe(
+            encoding.encode(RULE_TWO),
+          );
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C08-C09 applies the node tie-break equally to Rule values and null for $name',
+      async encoding => {
+        const valueWinsTimestamp = tiedHulc(14_000, 11, HIGH_NODE);
+        const losingNullTimestamp = tiedHulc(14_000, 11, LOW_NODE);
+        const valueWins = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 14_000, HIGH_NODE),
+          valueWinsTimestamp,
+        );
+        const nullLoses = withTimestamp(
+          ruleMessage(encoding, null, 14_000, LOW_NODE),
+          losingNullTimestamp,
+        );
+        const valueExpected: ExpectedProbeState = {
+          manualBudgetPeriod: null,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: null,
+            ruleAssignment: RULE_TWO,
+            source: 'rule',
+            effectiveBudgetPeriod: 202412,
+          },
+          winningManualTimestamp: null,
+          winningRuleTimestamp: valueWinsTimestamp.toString(),
+        };
+
+        for (const plan of [
+          singletonPlan([valueWins, nullLoses]),
+          singletonPlan([nullLoses, valueWins]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, valueExpected);
+        }
+
+        const losingValueTimestamp = tiedHulc(15_000, 12, LOW_NODE);
+        const nullWinsTimestamp = tiedHulc(15_000, 12, HIGH_NODE);
+        const valueLoses = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 15_000, LOW_NODE),
+          losingValueTimestamp,
+        );
+        const nullWins = withTimestamp(
+          ruleMessage(encoding, null, 15_000, HIGH_NODE),
+          nullWinsTimestamp,
+        );
+        const nullExpected: ExpectedProbeState = {
+          manualBudgetPeriod: null,
+          encodedRuleAssignment: null,
+          effectiveState: {
+            manualBudgetPeriod: null,
+            ruleAssignment: null,
+            source: 'default',
+            effectiveBudgetPeriod: 202409,
+          },
+          winningManualTimestamp: null,
+          winningRuleTimestamp: nullWinsTimestamp.toString(),
+        };
+
+        for (const plan of [
+          singletonPlan([valueLoses, nullWins]),
+          singletonPlan([nullWins, valueLoses]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, nullExpected);
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C10 keeps Manual effective across cells with equal time and counter for $name',
+      async encoding => {
+        const manualTimestamp = tiedHulc(16_000, 13, LOW_NODE);
+        const ruleTimestamp = tiedHulc(16_000, 13, HIGH_NODE);
+        const manual = withTimestamp(
+          manualMessage(encoding, 202411, 16_000, LOW_NODE),
+          manualTimestamp,
+        );
+        const rule = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 16_000, HIGH_NODE),
+          ruleTimestamp,
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: manualTimestamp.toString(),
+          winningRuleTimestamp: ruleTimestamp.toString(),
+        };
+
+        expect(manualTimestamp.toString() < ruleTimestamp.toString()).toBe(
+          true,
+        );
+        for (const plan of [
+          singletonPlan([manual, rule]),
+          singletonPlan([rule, manual]),
+        ]) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+          expect(await readPersistedMessages(encoding)).toHaveLength(2);
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C11 converges across mixed network chunks for $name',
+      async encoding => {
+        const ruleOne = ruleMessage(encoding, RULE_ONE, 17_000);
+        const manualOne = manualMessage(encoding, 202410, 18_000);
+        const ruleTwo = ruleMessage(encoding, RULE_TWO, 19_000, SECOND_CLIENT);
+        const manualTwo = manualMessage(
+          encoding,
+          202411,
+          20_000,
+          SECOND_CLIENT,
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: manualTwo.timestamp.toString(),
+          winningRuleTimestamp: ruleTwo.timestamp.toString(),
+        };
+        const plans: DeliveryPlan[] = [
+          [[ruleTwo, manualOne], [ruleOne], [manualTwo]],
+          [
+            [manualTwo, ruleOne],
+            [manualOne, ruleTwo],
+          ],
+          [[ruleOne, manualTwo, ruleTwo], [manualOne]],
+        ];
+        let referenceMessages: PersistedMessage[] | undefined;
+
+        for (const plan of plans) {
+          await resetProbeDatabase();
+          await deliver(plan);
+          await expectExplicitProbeState(encoding, expected);
+
+          const persisted = await readPersistedMessages(encoding);
+          expect(persisted).toHaveLength(4);
+          if (referenceMessages === undefined) {
+            referenceMessages = persisted;
+          } else {
+            expect(persisted).toEqual(referenceMessages);
+          }
+        }
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C12-C13 keeps winners through exact replay and late stale messages for $name',
+      async encoding => {
+        const oldRule = ruleMessage(encoding, RULE_ONE, 21_000);
+        const oldManual = manualMessage(encoding, 202410, 22_000);
+        const newRule = ruleMessage(encoding, RULE_TWO, 23_000, SECOND_CLIENT);
+        const newManual = manualMessage(
+          encoding,
+          202411,
+          24_000,
+          SECOND_CLIENT,
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: newManual.timestamp.toString(),
+          winningRuleTimestamp: newRule.timestamp.toString(),
+        };
+
+        expect(await applyMessages([newRule, newManual])).toEqual([
+          newRule,
+          newManual,
+        ]);
+        expect(await applyMessages([newRule, newManual])).toEqual([]);
+        expect(await readPersistedMessages(encoding)).toHaveLength(2);
+
+        expect(await applyMessages([oldRule, oldManual])).toEqual([
+          { ...oldRule, old: true },
+          { ...oldManual, old: true },
+        ]);
+        await expectExplicitProbeState(encoding, expected);
+        expect(await readPersistedMessages(encoding)).toHaveLength(4);
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C14 advances the local clock through receiveMessages without changing the winner for $name',
+      async encoding => {
+        await resetProbeDatabase();
+        const receiveTime = Date.now();
+        const rule = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 100, SECOND_CLIENT),
+          new Timestamp(receiveTime + 100, 0, SECOND_CLIENT),
+        );
+        const manual = withTimestamp(
+          manualMessage(encoding, 202411, 200, MANUAL_CLIENT),
+          new Timestamp(receiveTime + 200, 0, MANUAL_CLIENT),
+        );
+        const receivedTimestamps = [
+          rule.timestamp.toString(),
+          manual.timestamp.toString(),
+        ];
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: manual.timestamp.toString(),
+          winningRuleTimestamp: rule.timestamp.toString(),
+        };
+        const beforeApply = getClock().timestamp.toString();
+
+        await deliver([[rule], [manual]], applyMessages);
+        const stateAfterApply = await readEffectiveState(encoding);
+        const messagesAfterApply = await readPersistedMessages(encoding);
+        expect(getClock().timestamp.toString()).toBe(beforeApply);
+
+        await resetProbeDatabase();
+        const beforeReceive = getClock().timestamp.toString();
+        await deliver([[manual], [rule]], receiveMessages);
+
+        expect(getClock().timestamp.toString() > beforeReceive).toBe(true);
+        expect([
+          rule.timestamp.toString(),
+          manual.timestamp.toString(),
+        ]).toEqual(receivedTimestamps);
+        await expectExplicitProbeState(encoding, expected);
+        expect(await readEffectiveState(encoding)).toEqual(stateAfterApply);
+        expect(await readPersistedMessages(encoding)).toEqual(
+          messagesAfterApply,
+        );
+      },
+    );
+
+    it.each(ENCODINGS)(
+      'C15 persists both node-tied competitors while retaining explicit winners for $name',
+      async encoding => {
+        const lowManual = withTimestamp(
+          manualMessage(encoding, 202410, 25_000, LOW_NODE),
+          tiedHulc(25_000, 14, LOW_NODE),
+        );
+        const highManual = withTimestamp(
+          manualMessage(encoding, 202411, 25_000, HIGH_NODE),
+          tiedHulc(25_000, 14, HIGH_NODE),
+        );
+        const lowRule = withTimestamp(
+          ruleMessage(encoding, RULE_ONE, 26_000, LOW_NODE),
+          tiedHulc(26_000, 15, LOW_NODE),
+        );
+        const highRule = withTimestamp(
+          ruleMessage(encoding, RULE_TWO, 26_000, HIGH_NODE),
+          tiedHulc(26_000, 15, HIGH_NODE),
+        );
+        const expected: ExpectedProbeState = {
+          manualBudgetPeriod: 202411,
+          encodedRuleAssignment: encoding.encode(RULE_TWO),
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+          winningManualTimestamp: highManual.timestamp.toString(),
+          winningRuleTimestamp: highRule.timestamp.toString(),
+        };
+
+        expect(await applyMessages([highManual, highRule])).toEqual([
+          highManual,
+          highRule,
+        ]);
+        expect(await applyMessages([lowManual, lowRule])).toEqual([
+          { ...lowManual, old: true },
+          { ...lowRule, old: true },
+        ]);
+        await expectExplicitProbeState(encoding, expected);
+        expect(
+          (await readPersistedMessages(encoding)).map(message => ({
+            column: message.column,
+            timestamp: message.timestamp,
+          })),
+        ).toEqual([
+          {
+            column: 'manual_budget_period',
+            timestamp: lowManual.timestamp.toString(),
+          },
+          {
+            column: 'manual_budget_period',
+            timestamp: highManual.timestamp.toString(),
+          },
+          {
+            column: 'rule_assignment',
+            timestamp: lowRule.timestamp.toString(),
+          },
+          {
+            column: 'rule_assignment',
+            timestamp: highRule.timestamp.toString(),
+          },
+        ]);
+      },
+    );
+
+    it('C16 reaches the same logical state with canonical JSON and legacy POC text', async () => {
+      const observed: Array<{
+        encoding: RuleEncoding['name'];
+        rawRuleAssignment: string | null;
+        effectiveState: EffectiveState;
+      }> = [];
+
+      for (const encoding of ENCODINGS) {
+        await resetProbeDatabase();
+        await applyMessages([
+          ruleMessage(encoding, RULE_TWO, 27_000, SECOND_CLIENT),
+          manualMessage(encoding, 202411, 28_000, MANUAL_CLIENT),
+        ]);
+        observed.push({
+          encoding: encoding.name,
+          rawRuleAssignment:
+            (await readProbeRow(encoding))?.rule_assignment ?? null,
+          effectiveState: await readEffectiveState(encoding),
+        });
+      }
+
+      expect(observed).toEqual([
+        {
+          encoding: 'json',
+          rawRuleAssignment:
+            '{"period":"2024-12","ruleId":"rule/2|replacement"}',
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+        },
+        {
+          encoding: 'text',
+          rawRuleAssignment: '202412|rule%2F2%7Creplacement',
+          effectiveState: {
+            manualBudgetPeriod: 202411,
+            ruleAssignment: RULE_TWO,
+            source: 'manual',
+            effectiveBudgetPeriod: 202411,
+          },
+        },
+      ]);
+    });
   });
 
   describe('representation validation', () => {
