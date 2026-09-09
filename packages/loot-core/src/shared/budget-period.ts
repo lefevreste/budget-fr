@@ -36,10 +36,49 @@ export type BudgetPeriodResult<T> =
       error: Readonly<{ code: BudgetPeriodErrorCode }>;
     }>;
 
+export type StoredRuleAssignmentState =
+  | Readonly<{ kind: 'absent'; raw: null }>
+  | Readonly<{ kind: 'valid'; raw: string; value: RuleAssignment }>
+  | Readonly<{
+      kind: 'invalid';
+      raw: unknown;
+      error: Readonly<{ code: BudgetPeriodErrorCode }>;
+    }>;
+
+export type StoredBudgetPeriodResult =
+  | Readonly<{
+      ok: true;
+      projection: BudgetPeriodProjection;
+      ruleAssignment: Exclude<StoredRuleAssignmentState, { kind: 'invalid' }>;
+      diagnostic?: never;
+    }>
+  | Readonly<{
+      ok: true;
+      projection: BudgetPeriodProjection;
+      ruleAssignment: Extract<StoredRuleAssignmentState, { kind: 'invalid' }>;
+      diagnostic: Readonly<{
+        kind: 'invalid-rule-assignment';
+        error: Readonly<{ code: BudgetPeriodErrorCode }>;
+      }>;
+    }>
+  | Readonly<{
+      ok: false;
+      error: Readonly<{ code: BudgetPeriodErrorCode }>;
+      ruleAssignment?: Extract<StoredRuleAssignmentState, { kind: 'invalid' }>;
+      projection?: never;
+      diagnostic?: never;
+    }>;
+
 type BudgetPeriodInput = Readonly<{
   bankDate: string;
   manualBudgetPeriod: unknown;
   ruleAssignment: unknown;
+}>;
+
+type StoredBudgetPeriodInput = Readonly<{
+  bankDate: string;
+  manualBudgetPeriod: unknown;
+  rawRuleAssignment: unknown;
 }>;
 
 function success<T>(value: T): BudgetPeriodResult<T> {
@@ -48,6 +87,12 @@ function success<T>(value: T): BudgetPeriodResult<T> {
 
 function failure(code: BudgetPeriodErrorCode): BudgetPeriodResult<never> {
   return { ok: false, error: { code } };
+}
+
+function validateBankDate(value: string): BudgetPeriodResult<void> {
+  return isValidYearMonthDay(value)
+    ? success(undefined)
+    : failure('invalid-bank-date');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -140,11 +185,104 @@ export function decodeRuleAssignment(
   return assignment;
 }
 
+export function decodeStoredRuleAssignment(
+  raw: unknown,
+): StoredRuleAssignmentState {
+  if (raw === null) {
+    return { kind: 'absent', raw: null };
+  }
+
+  const assignment = decodeRuleAssignment(raw);
+  if (assignment.ok === false) {
+    return {
+      kind: 'invalid',
+      raw,
+      error: assignment.error,
+    };
+  }
+
+  if (typeof raw !== 'string') {
+    return {
+      kind: 'invalid',
+      raw,
+      error: { code: 'rule-assignment-not-json-string' },
+    };
+  }
+
+  return { kind: 'valid', raw, value: assignment.value };
+}
+
+export function deriveStoredBudgetPeriod(
+  input: StoredBudgetPeriodInput,
+): StoredBudgetPeriodResult {
+  const bankDate = validateBankDate(input.bankDate);
+  if (bankDate.ok === false) {
+    return bankDate;
+  }
+
+  let manualBudgetPeriod: BudgetPeriod | null = null;
+  if (input.manualBudgetPeriod !== null) {
+    const manual = parseBudgetPeriod(input.manualBudgetPeriod);
+    if (manual.ok === false) {
+      return { ok: false, error: manual.error };
+    }
+    manualBudgetPeriod = manual.value;
+  }
+
+  const ruleAssignment = decodeStoredRuleAssignment(input.rawRuleAssignment);
+
+  if (manualBudgetPeriod !== null) {
+    const projection = deriveBudgetPeriod({
+      bankDate: input.bankDate,
+      manualBudgetPeriod,
+      ruleAssignment: null,
+    });
+    if (projection.ok === false) {
+      return { ok: false, error: projection.error };
+    }
+
+    if (ruleAssignment.kind === 'invalid') {
+      return {
+        ok: true,
+        projection: projection.value,
+        ruleAssignment,
+        diagnostic: {
+          kind: 'invalid-rule-assignment',
+          error: ruleAssignment.error,
+        },
+      };
+    }
+
+    return { ok: true, projection: projection.value, ruleAssignment };
+  }
+
+  if (ruleAssignment.kind === 'invalid') {
+    return {
+      ok: false,
+      error: ruleAssignment.error,
+      ruleAssignment,
+    };
+  }
+
+  const projection = deriveBudgetPeriod({
+    bankDate: input.bankDate,
+    manualBudgetPeriod: null,
+    ruleAssignment:
+      ruleAssignment.kind === 'valid' ? ruleAssignment.value : null,
+  });
+  if (projection.ok === false) {
+    return { ok: false, error: projection.error };
+  }
+
+  return { ok: true, projection: projection.value, ruleAssignment };
+}
+
 export function deriveBudgetPeriod(
   input: BudgetPeriodInput,
 ): BudgetPeriodResult<BudgetPeriodProjection> {
-  if (!isValidYearMonthDay(input.bankDate)) {
-    return failure('invalid-bank-date');
+  const bankDate = validateBankDate(input.bankDate);
+  if (bankDate.ok === false) {
+    return bankDate;
   }
 
   let manualBudgetPeriod: BudgetPeriod | null = null;
