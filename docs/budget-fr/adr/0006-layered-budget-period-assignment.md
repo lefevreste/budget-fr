@@ -2,6 +2,7 @@
 
 - Statut : Acceptée
 - Date : 2026-09-02
+- Amendée le : 09/09/2026
 - Décideurs : équipe Budget FR
 - Portée : phase Budget Period du MVP Budget FR dans Actual Budget
 - Supersède :
@@ -12,6 +13,8 @@
 - Références :
   [premier POC CRDT](../spikes/budget-period-crdt.md),
   [POC option D](../spikes/budget-period-option-d.md),
+  [POC de convergence option D](../spikes/budget-period-option-d-convergence.md),
+  [spike Rule stockée invalide](../spikes/budget-period-invalid-rule-assignment.md),
   [spécification fonctionnelle](../functional-spec.md),
   [architecture Budget FR](../architecture.md)
 
@@ -37,40 +40,67 @@ d'une livraison partielle et peut supprimer une correction Manual légitime.
 
 Le second POC a exercé l'option D avec les vrais mécanismes `db.update`,
 `sendMessages`, `batchMessages`, `applyMessages`, les timestamps HULC,
-`messages_crdt`, SQLite et le compilateur AQL. Il démontre, pour les plans de
-livraison testés, la convergence de deux couches indépendantes, l'indivisibilité
-du composite Rule et la faisabilité d'une projection effective
-`Manual > Rule > Default`.
+`messages_crdt`, une table de probe SQLite en mémoire et le compilateur AQL. Il
+démontre, pour les plans de livraison testés, la convergence de deux couches
+indépendantes, l'indivisibilité du composite Rule et la faisabilité d'une
+projection effective `Manual > Rule > Default`.
+
+Le POC de convergence option D ferme ensuite les permutations bornées et le
+départage HULC par `node` pour le modèle expérimental mono-ligne. Le spike Rule
+stockée invalide démontre que le type AQL `json` confond un JSON syntaxiquement
+invalide avec une absence SQL et que `json/fallback` ne préserve pas la forme
+lexicale canonique. Le type AQL `string` conserve en revanche la valeur brute.
 
 Ces preuves autorisent une implémentation expérimentale écrite et validée avant
-toute diffusion. Elles ne couvrent pas encore toutes les permutations réseau,
-les clients de versions différentes, la migration réelle ni l'atomicité des
-splits et transferts. Les divergences actuelles de `functional-spec.md` doivent
-être corrigées avant l'implémentation fonctionnelle.
+toute diffusion. Elles ne couvrent pas les clients de versions différentes,
+les exécuteurs AQL spécialisés, l'intégration applicative, la migration réelle
+ni l'atomicité des splits et transferts.
+
+## Amendement du 09/09/2026
+
+La décision initiale d'ADR-0006 prévoyait d'exposer `rule_assignment` avec le
+type AQL `json`. Le spike Rule stockée invalide a démontré dynamiquement, par le
+chemin AQL générique `execQuery`, que ce type transforme un JSON syntaxiquement
+invalide en `null` et le rend indistinguable d'une Rule réellement absente. Le
+type `json/fallback` transforme également un JSON valide non canonique et ne
+préserve donc pas sa représentation brute.
+
+La décision est amendée : AQL doit exposer `rule_assignment` comme `string`.
+Le stockage SQLite `TEXT NULL` et le contenu JSON canonique d'une valeur valide
+restent inchangés. Cet amendement ne prétend pas que `string` faisait partie de
+la décision initiale ; il la remplace à partir du 09/09/2026.
 
 ## Décision
 
 L'affectation de période budgétaire est représentée par deux propriétés
-transaction-locales, nullables et synchronisées séparément :
+transaction-locales, nullables et synchronisées séparément. La seconde est lue
+sous sa forme physique brute avant tout décodage métier :
 
 ```text
 manual_budget_period: date-month | null
-rule_assignment: { period: date-month, ruleId: string } | null
+rule_assignment: string | null
+
+decode(rule_assignment):
+  absent
+  | valid { period: date-month, ruleId: string }
+  | invalid { raw, error }
 ```
 
-La source et la période effective sont dérivées :
+Le contenu valide de `rule_assignment` reste le JSON canonique Budget FR. La
+source et la période effective sont dérivées uniquement après validation de
+`bankDate`, de Manual et de l'état Rule décodé :
 
 ```text
-source =
-  manual si manual_budget_period != null
-  sinon rule si rule_assignment != null
-  sinon default
-
-effectiveBudgetPeriod =
-  manual_budget_period
-  sinon rule_assignment.period
-  sinon month(date)
+bankDate invalide -> erreur
+Manual invalide -> erreur
+Manual valide -> Manual, avec diagnostic obligatoire si Rule est invalide
+Manual absente + Rule valide -> Rule
+Manual absente + Rule absente -> Default dérivé de month(date)
+Manual absente + Rule invalide -> erreur sans projection
 ```
+
+La priorité d'erreur est `bankDate > Manual > Rule`. Une valeur Rule brute non
+nulle n'est jamais assimilée à une Rule valide du seul fait de sa présence.
 
 `manual_budget_period` et `rule_assignment` sont deux cellules CRDT LWW
 indépendantes. Le composite Rule est une seule cellule : sa période et son
@@ -109,10 +139,17 @@ conflit et d'expliquer la règle ayant produit l'affectation courante.
 9. Deux Rule concurrentes sont départagées par le LWW du composite Rule.
 10. Une suppression est une valeur `null` soumise au même LWW que les valeurs
     non nulles de sa cellule.
-11. La suppression Manual révèle la dernière Rule persistée ; si Rule est
-    également nulle, elle révèle Default.
+11. La suppression Manual révèle la dernière Rule persistée si elle est valide ;
+    une Rule invalide bloque la projection et une Rule absente révèle Default.
 12. Une valeur Default n'est pas matérialisée : elle suit immédiatement
     `month(date)`.
+13. Une valeur Rule invalide ne devient jamais `null` ou Default implicitement.
+14. La valeur Rule brute ne doit jamais être journalisée automatiquement.
+
+Le spike constate uniquement l'absence de cette journalisation dans le module
+de domaine expérimental. Aucun consommateur ou adaptateur applicatif n'est
+branché : aucune garantie globale de journalisation n'est donc démontrée. Ce
+point devra être vérifié lors de l'intégration applicative.
 
 ### Projection effective obligatoire
 
@@ -130,18 +167,19 @@ l'utiliser :
 - règles ;
 - prévisions budgétaires.
 
-Aucun consommateur ne doit lire `rule_assignment.period` comme période
-effective sans vérifier d'abord `manual_budget_period`. Les tests de production
-devront empêcher le contournement de cette abstraction.
+Aucun consommateur ne doit lire ou parser directement `rule_assignment`, ni
+utiliser sa propriété `period` sans passer par l'adaptateur discriminé puis par
+la priorité Manual. Les tests de production devront empêcher le contournement
+de cette abstraction.
 
 ## Représentation SQLite et AQL
 
 ### SQLite envisagé
 
-| Colonne                | Type SQLite | Valeur physique                               |
-| ---------------------- | ----------- | --------------------------------------------- |
-| `manual_budget_period` | `INTEGER`   | `YYYYMM` ou `NULL`                            |
-| `rule_assignment`      | `TEXT`      | JSON canonique `{ period, ruleId }` ou `NULL` |
+| Colonne                | Type SQLite    | Valeur physique                               |
+| ---------------------- | -------------- | --------------------------------------------- |
+| `manual_budget_period` | `INTEGER NULL` | `YYYYMM` ou `NULL`                            |
+| `rule_assignment`      | `TEXT NULL`    | JSON canonique `{ period, ruleId }` ou `NULL` |
 
 `manual_budget_period` réutilise la représentation physique du type AQL
 `date-month`. `rule_assignment` est stocké dans une seule colonne `TEXT` afin
@@ -153,26 +191,22 @@ Aucune colonne de source dérivée n'est ajoutée. Aucun jour fictif, clé
 ### AQL envisagé
 
 - `manual_budget_period` est exposé en `date-month` ;
-- `rule_assignment` est exposé en `json` ;
-- la vue transaction expose une source et une période effective dérivées ;
-- lecture, écriture, filtre, tri et agrégation utilisent les conversions AQL
-  existantes et la projection complète ;
-- le convertisseur AQL `json` sérialise et désérialise, mais ne valide pas la
-  forme métier du composite.
+- `rule_assignment` est exposé sous sa forme brute en `string` ;
+- les types `json` et `json/fallback` sont interdits pour cette cellule ;
+- le décodage métier produit obligatoirement `absent`, `valid` ou `invalid` ;
+- une vue transaction, un filtre, un tri ou une agrégation ne peut exposer une
+  période effective qu'après cette validation complète.
 
-La projection SQLite conceptuelle est :
+Le chemin générique `execQuery` est le seul chemin AQL validé dynamiquement par
+le spike. Les exécuteurs AQL spécialisés des transactions et
+`db.selectWithSchema` ont uniquement été inspectés statiquement et restent à
+tester avant intégration.
 
-```text
-COALESCE(
-  manual_budget_period,
-  period extraite de rule_assignment,
-  date / 100
-)
-```
-
-Le POC démontre que SQLite peut utiliser un index sur l'expression exacte pour
-les représentations testées. Il ne démontre aucun gain de performance. Aucun
-index n'est donc décidé avant une mesure sur une base représentative.
+La projection SQL directe utilisant `json_extract`, une expression `COALESCE`
+fondée sur la Rule brute ou un index construit sur cette projection est
+reportée. Aucune de ces constructions n'est considérée sûre tant que l'état
+discriminé et sa politique d'erreur ne sont pas intégrés dans les vrais chemins
+de lecture.
 
 ## JSON canonique
 
@@ -194,17 +228,24 @@ L'encodeur de domaine doit produire exactement les clés `period`, puis
 - une sérialisation qui ne respecte pas la forme canonique décidée.
 
 L'ordre des clés est une politique d'encodage Budget FR. Il n'est imposé ni
-par le CRDT, ni par SQLite, ni par le type AQL `json`.
+par le CRDT, ni par SQLite, ni par le type AQL `string`, qui préserve la valeur
+brute sans la valider.
 
 Un encodeur et un validateur métier centralisés sont obligatoires avant toute
 écriture locale. Une écriture AQL générique ne suffit pas à faire respecter le
 contrat.
 
-Une valeur synchronisée invalide ne doit jamais être interprétée
-silencieusement comme Default. Elle doit être détectée et produire un état
-d'erreur explicite. La frontière exacte de détection ainsi que la politique de
-rejet, de quarantaine, de récupération et de resynchronisation restent à
-décider avant toute migration, activation ou livraison en production.
+L'adaptateur discriminé existe dans le module de domaine expérimental. Il n'est
+ni réexporté ni branché sur l'application. Une valeur synchronisée invalide est
+conservée avec son erreur de décodage : elle n'est ni transformée en `null` ou
+Default, ni réparée ou effacée automatiquement. Une Manual valide reste
+effective avec un diagnostic obligatoire ; sans Manual, l'erreur bloque toute
+projection.
+
+La récupération nécessite une écriture CRDT plus récente contenant soit une
+Rule canonique, soit un `null` explicite. La valeur brute ne doit pas être
+journalisée automatiquement. La présentation du diagnostic, la quarantaine
+éventuelle et la procédure applicative de resynchronisation restent à définir.
 
 ## Politiques produit
 
@@ -269,14 +310,31 @@ les deux colonnes avant l'activation de la fonctionnalité. Comme ADR-0002, cett
 décision ne garantit pas la coexistence avec un ancien client recevant une
 colonne inconnue.
 
-Le POC démontre la convergence pour quatre plans de livraison représentatifs,
-pas pour toutes les permutations possibles. Il ne couvre pas une livraison
-mixte, inverse dans une cellule et directe dans l'autre, ni une égalité du temps
-physique et du compteur HULC départagée par `node`.
+Le POC de convergence option D démontre dynamiquement les permutations bornées,
+les livraisons mixtes et le départage d'horodatages HULC de même temps physique
+et compteur par `node`, pour le modèle expérimental mono-ligne couvert. Ces
+propriétés doivent rester protégées par des tests de non-régression ; elles ne
+démontrent ni la compatibilité entre versions de clients, ni l'atomicité de
+plusieurs lignes.
+
+Le spike Rule stockée invalide démontre dynamiquement, avec une table de probe
+SQLite en mémoire, `receiveMessages`, `applyMessages` et `messages_crdt` : une
+chaîne invalide reçue par synchronisation reste persistée telle quelle dans la
+table et dans l'état CRDT. Elle n'est ni réparée ni effacée automatiquement.
+Seule une écriture CRDT plus récente contenant une Rule canonique ou un `null`
+explicite permet la récupération.
+
+Cette table représente une cellule synchronisée générique ; elle n'est pas la
+vraie table `transactions` et ne démontre pas le comportement de la persistance
+applicative réelle, des vues, des listeners, des exécuteurs AQL spécialisés ou
+de `db.selectWithSchema`. Ces limites ne réduisent pas les observations directes
+obtenues par le chemin générique `execQuery`, `receiveMessages`,
+`applyMessages` et `messages_crdt`.
 
 `messages_crdt` contient l'état technique nécessaire à la convergence. Il ne
 contient pas l'acteur, le motif ou le commentaire exigés d'un journal d'audit
-métier et ne doit jamais être présenté comme tel.
+métier et ne doit jamais être présenté comme tel. La valeur brute invalide ne
+doit pas non plus être journalisée automatiquement.
 
 ## Splits et transferts
 
@@ -298,7 +356,8 @@ La future migration sera additive, nullable et sans backfill :
 
 1. ajouter `manual_budget_period INTEGER NULL` à `transactions` ;
 2. ajouter `rule_assignment TEXT NULL` à `transactions` ;
-3. enregistrer leurs types dans le schéma AQL ;
+3. enregistrer `manual_budget_period` en `date-month` et `rule_assignment` en
+   `string` dans le schéma AQL ;
 4. recréer les vues transaction selon le mécanisme Actual ;
 5. laisser toutes les anciennes transactions dans l'état Default dérivé ;
 6. vérifier l'ouverture et la réouverture d'une base antérieure ;
@@ -306,7 +365,9 @@ La future migration sera additive, nullable et sans backfill :
 
 Aucun index initial, aucune contrainte `NOT NULL` et aucun backfill ne sont
 prévus. La validation métier ne doit toutefois pas être confondue avec
-l'absence de contrainte SQLite.
+l'absence de contrainte SQLite. La projection SQL réelle, les vues qui
+l'exposeraient et tout index associé restent reportés jusqu'à l'intégration et
+la validation du décodage discriminé.
 
 Cette ADR ne crée pas la migration et n'en fixe pas encore le numéro ou le
 patch exact. La stratégie réelle doit être revue avec les vues, les types DB,
@@ -329,16 +390,24 @@ n'est présumée par cette ADR.
 - La source est cohérente par construction avec la couche effective.
 - La solution reste transaction-locale et réutilise SQLite, AQL et le CRDT
   générique d'Actual.
+- Une Rule brute invalide reste distinguable d'une Rule absente et ne peut pas
+  produire silencieusement un faux Default.
 
 ### Coûts et limitations
 
 - Tous les consommateurs doivent adopter une projection centralisée.
-- Le JSON nécessite un encodeur et une validation métier qui n'existent pas
-  encore en production.
+- L'encodeur, le décodeur discriminé et la projection existent uniquement dans
+  le module de domaine expérimental, non réexporté et non branché sur
+  l'application.
 - Deux cellules signifient qu'un reset distribué expose des états
   intermédiaires.
-- Les clients de versions différentes et les messages invalides n'ont pas de
-  stratégie de récupération validée.
+- La récupération CRDT d'une Rule invalide est démontrée dans le modèle
+  expérimental, mais sa présentation et son traitement applicatifs ne le sont
+  pas.
+- Les clients de versions différentes n'ont pas de stratégie de compatibilité
+  validée.
+- Les exécuteurs AQL spécialisés des transactions et `db.selectWithSchema`
+  n'ont été qu'inspectés statiquement.
 - Les splits et transferts restent des opérations multi-lignes non atomiques.
 - Un snapshot Rule conservé après suppression de sa règle peut demander une
   explication spécifique dans l'UI et l'API.
@@ -363,46 +432,50 @@ Rejetées : une réparation ne connaît pas les frontières de batch distantes,
 peut effacer une Manual en cours de livraison et ne détecte pas tous les
 mélanges sémantiques.
 
-### Texte canonique
+### Exposition AQL `json` ou `json/fallback`
 
-Le texte canonique testé est techniquement viable et conserve l'unité de
-conflit. JSON est retenu comme recommandation parce qu'Actual possède déjà un
-type AQL `json`, que SQLite JSON1 permet l'extraction et que la lecture AQL
-reste structurée. Cette recommandation reste conditionnée à l'encodeur et au
-validateur métier centralisés.
+Rejetée par l'amendement du 09/09/2026 : `json` transforme un JSON
+syntaxiquement invalide en `null`, tandis que `json/fallback` ne préserve pas
+la représentation brute de toute valeur valide non canonique. Le contenu
+métier valide reste du JSON canonique, mais son transport AQL doit être une
+`string` décodée par l'adaptateur discriminé Budget FR.
 
 ## Risques et décisions ouvertes
 
-| Risque ou décision ouverte                      | Niveau   | Gate avant production                                |
-| ----------------------------------------------- | -------- | ---------------------------------------------------- |
-| JSON synchronisé invalide                       | Critique | Définir détection, rejet/quarantaine et récupération |
-| Ancien client recevant une colonne inconnue     | Critique | Définir compatibilité et procédure clients mixtes    |
-| Consommateur contournant Manual                 | Critique | Centraliser et tester `effectiveBudgetPeriod`        |
-| Migration ou vues partiellement appliquées      | Élevé    | Concevoir et tester la migration réelle              |
-| Permutation CRDT ou égalité HULC non testée     | Élevé    | Élargir la matrice et tester le départage par `node` |
-| Divergence de lignes d'un split ou transfert    | Élevé    | Décider et tester une stratégie multi-lignes         |
-| Snapshot lié à une règle supprimée mal expliqué | Moyen    | Définir le contrat API/UI de provenance              |
-| Index d'expression coûteux ou inutile           | Moyen    | Mesurer avant toute création                         |
+| Risque ou décision ouverte                        | Niveau   | Gate avant production                              |
+| ------------------------------------------------- | -------- | -------------------------------------------------- |
+| Adaptateur non branché sur l'application          | Critique | Intégrer sans contournement de l'état discriminé   |
+| Exécuteurs AQL spécialisés non testés             | Critique | Tester transactions et `db.selectWithSchema`       |
+| Ancien client recevant une colonne inconnue       | Critique | Définir compatibilité et procédure clients mixtes  |
+| Consommateur ou agrégation contournant Manual     | Critique | Centraliser et tester `effectiveBudgetPeriod`      |
+| Migration, ancienne base ou restauration          | Élevé    | Tester migration, backup et restauration           |
+| Vue ou index fondé sur une projection non validée | Élevé    | Concevoir, tester et mesurer les chemins SQL réels |
+| Divergence de lignes d'un split ou transfert      | Élevé    | Décider et tester une stratégie multi-lignes       |
+| Snapshot lié à une règle supprimée mal expliqué   | Moyen    | Définir le contrat API/UI de provenance            |
 
-Les politiques ouvertes de synchronisation invalide, de clients mixtes et de
-multi-lignes ne sont pas fermées par cette ADR. Elles doivent être décidées et
-démontrées avant la migration de production.
+La distinction de domaine Rule absente, valide ou invalide, les permutations
+CRDT bornées et le départage HULC par `node` sont fermés uniquement dans le
+modèle expérimental mono-ligne couvert. L'intégration applicative, les chemins
+AQL spécialisés, les clients mixtes, les consommateurs, la migration, les vues
+et index réels ainsi que les opérations multi-lignes restent à décider et à
+démontrer avant la migration de production.
 
 ## Tests obligatoires avant production
 
 ### CRDT et synchronisation
 
-- étendre la matrice de permutations de livraison ;
-- couvrir une livraison inverse dans une cellule et directe dans l'autre ;
-- couvrir l'égalité du temps et du compteur HULC départagée par `node` ;
-- conserver les scénarios Rule/Manual, deux Rule, deux Manual, suppressions,
-  resets concurrents et rejeu idempotent ;
-- exercer le comportement choisi pour un JSON synchronisé invalide ;
+- conserver en non-régression les permutations bornées, les livraisons mixtes,
+  le départage HULC par `node`, les scénarios Rule/Manual, deux Rule, deux
+  Manual, suppressions, resets concurrents et rejeu idempotent ;
+- conserver la preuve qu'une Rule synchronisée invalide reste persistée, ne
+  devient jamais Default et n'est récupérée que par une écriture plus récente ;
 - reproduire un client ancien, sa mise à jour et la reprise de synchronisation.
 
 ### Domaine et consommateurs
 
-- tester Default, Rule, Manual et la suppression Manual révélant Rule ;
+- conserver les tests Default, Rule, Manual, Rule absente/valide/invalide et la
+  suppression Manual révélant Rule ou son erreur ;
+- intégrer l'adaptateur discriminé sans le contourner ;
 - tester chaque famille de consommateurs contre un contournement de Manual ;
 - tester le maintien de `date` pour soldes, trésorerie et forecast journalier ;
 - tester la période effective pour budgets et prévisions budgétaires ;
@@ -412,9 +485,12 @@ démontrées avant la migration de production.
 
 ### JSON, SQLite, AQL et migration
 
-- rejeter clés manquantes ou supplémentaires, période invalide, `ruleId` vide
-  et sérialisation non canonique ;
-- vérifier lecture, écriture, filtre, tri et agrégation AQL de la projection ;
+- conserver les tests de rejet des clés manquantes ou supplémentaires, période
+  invalide, `ruleId` vide et sérialisation non canonique ;
+- tester dynamiquement les exécuteurs AQL spécialisés des transactions et
+  `db.selectWithSchema` avec les trois états discriminés ;
+- vérifier lecture, écriture, filtre, tri et agrégation AQL de la projection
+  après intégration de la validation ;
 - ouvrir puis rouvrir une base antérieure à la migration ;
 - vérifier vues, backup, restauration et synchronisation après migration ;
 - mesurer avant de décider un index d'expression.
@@ -438,7 +514,10 @@ sémantiques d'affectation dépendantes d'ADR-0002.
 ### Architecture option D
 
 **READY FOR EXPERIMENTAL / TEST-FIRST IMPLEMENTATION** — les POC démontrent les
-propriétés CRDT nécessaires et la faisabilité SQLite/AQL pour les plans testés.
+propriétés CRDT/HULC bornées, la distinction Rule absente/valide/invalide et la
+faisabilité du transport AQL brut pour le modèle expérimental mono-ligne. Ils
+ne démontrent pas encore l'intégration applicative ni les chemins AQL
+spécialisés.
 
 L'implémentation expérimentale autorisée peut inclure :
 
@@ -446,7 +525,7 @@ L'implémentation expérimentale autorisée peut inclure :
 - la projection effective centralisée ;
 - le validateur et l'encodeur JSON ;
 - des prototypes de migration sur fixtures ;
-- le traitement expérimental des messages invalides ;
+- l'intégration expérimentale de l'adaptateur discriminé ;
 - les tests réels des splits et transferts ;
 - les tests de compatibilité.
 
@@ -462,15 +541,16 @@ Elle n'autorise pas :
 **NOT READY FOR PRODUCTION MIGRATION OR RELEASE** — la migration, l'activation
 et la livraison en production restent bloquées par :
 
-- la validation et la récupération des JSON synchronisés invalides ;
-- la matrice CRDT élargie et l'égalité HULC départagée par `node` ;
+- l'intégration de l'adaptateur discriminé dans les chemins applicatifs ;
+- la validation dynamique des exécuteurs AQL spécialisés des transactions et
+  de `db.selectWithSchema` ;
 - le contrat centralisé `effectiveBudgetPeriod` et les tests de consommateurs ;
 - la stratégie de compatibilité des clients de versions différentes ;
-- la conception et la validation de la migration réelle ;
-- les splits et transferts multi-lignes ;
-- le réalignement d'`architecture.md` et de `functional-spec.md` avec cette
-  décision.
+- la conception et la validation de la migration réelle, y compris anciennes
+  bases, backup et restauration ;
+- la conception et la validation des vues et index réels ;
+- les splits et transferts multi-lignes.
 
-Ces documents de cadrage ne sont pas modifiés par cette ADR. Leur réalignement
-est obligatoire avant l'implémentation fonctionnelle. Il ne fait pas obstacle
-aux travaux expérimentaux autorisés ci-dessus.
+La spécification fonctionnelle reste compatible avec cette décision : elle
+décrit les résultats métier sans imposer le transport AQL. Le présent
+amendement et `architecture.md` portent le changement technique nécessaire.
