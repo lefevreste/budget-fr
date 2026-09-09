@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   decodeRuleAssignment,
+  decodeStoredRuleAssignment,
   deriveBudgetPeriod,
+  deriveStoredBudgetPeriod,
   encodeRuleAssignment,
   isBudgetPeriod,
   parseBudgetPeriod,
@@ -282,5 +284,260 @@ describe('budget period projection', () => {
 
     expect(input.bankDate).toBe('2026-08-28');
     expect(JSON.stringify(input)).toBe(before);
+  });
+});
+
+describe('stored RuleAssignment decoding', () => {
+  const canonical = '{"period":"2024-10","ruleId":"rule-1"}';
+
+  it('I01 treats only SQLite NULL as absent', () => {
+    expect(decodeStoredRuleAssignment(null)).toEqual({
+      kind: 'absent',
+      raw: null,
+    });
+  });
+
+  it('I02 preserves canonical JSON and decodes its RuleAssignment', () => {
+    expect(decodeStoredRuleAssignment(canonical)).toEqual({
+      kind: 'valid',
+      raw: canonical,
+      value: {
+        period: '2024-10',
+        ruleId: 'rule-1',
+      },
+    });
+  });
+
+  it('I03 preserves syntax-invalid JSON with its discriminated error', () => {
+    const raw = '{"period":"2024-10"';
+
+    expect(decodeStoredRuleAssignment(raw)).toEqual({
+      kind: 'invalid',
+      raw,
+      error: { code: 'rule-assignment-invalid-json' },
+    });
+  });
+
+  it.each([
+    '{ "period": "2024-10", "ruleId": "rule-1" }',
+    '{"ruleId":"rule-1","period":"2024-10"}',
+    '{"period":"2024-11","period":"2024-10","ruleId":"rule-1"}',
+  ])('I04 preserves and rejects non-canonical JSON %j', raw => {
+    expect(decodeStoredRuleAssignment(raw)).toEqual({
+      kind: 'invalid',
+      raw,
+      error: { code: 'rule-assignment-non-canonical-json' },
+    });
+  });
+
+  it.each([
+    ['null', 'rule-assignment-not-object'],
+    ['[]', 'rule-assignment-not-object'],
+    ['"rule-1"', 'rule-assignment-not-object'],
+    ['42', 'rule-assignment-not-object'],
+  ] as const)('I05 never treats the JSON value %j as absent', (raw, code) => {
+    expect(decodeStoredRuleAssignment(raw)).toEqual({
+      kind: 'invalid',
+      raw,
+      error: { code },
+    });
+  });
+
+  it.each([
+    ['{"period":"2024-10"}', 'rule-assignment-invalid-keys'],
+    ['{"ruleId":"rule-1"}', 'rule-assignment-invalid-keys'],
+    [
+      '{"period":"2024-10","ruleId":"rule-1","extra":true}',
+      'rule-assignment-invalid-keys',
+    ],
+  ] as const)('I06 preserves and rejects invalid keys in %j', (raw, code) => {
+    expect(decodeStoredRuleAssignment(raw)).toEqual({
+      kind: 'invalid',
+      raw,
+      error: { code },
+    });
+  });
+
+  it.each([
+    ['{"period":202410,"ruleId":"rule-1"}', 'rule-assignment-invalid-period'],
+    [
+      '{"period":"2024-13","ruleId":"rule-1"}',
+      'rule-assignment-invalid-period',
+    ],
+    ['{"period":"2024-10","ruleId":1}', 'rule-assignment-invalid-rule-id'],
+    ['{"period":"2024-10","ruleId":""}', 'rule-assignment-invalid-rule-id'],
+  ] as const)('I07 preserves and rejects invalid fields in %j', (raw, code) => {
+    expect(decodeStoredRuleAssignment(raw)).toEqual({
+      kind: 'invalid',
+      raw,
+      error: { code },
+    });
+  });
+
+  it.each([undefined, 202410, { period: '2024-10', ruleId: 'rule-1' }])(
+    'I08 preserves and rejects the unexpected stored value %j',
+    raw => {
+      const result = decodeStoredRuleAssignment(raw);
+
+      expect(result).toEqual({
+        kind: 'invalid',
+        raw,
+        error: { code: 'rule-assignment-not-json-string' },
+      });
+      expect(result.raw).toBe(raw);
+    },
+  );
+});
+
+describe('stored budget period projection', () => {
+  const invalidRule = '{"period":"2024-13","ruleId":"rule-1"}';
+
+  it('I18 structurally omits projection from a blocking Rule result', () => {
+    const result = deriveStoredBudgetPeriod({
+      bankDate: '2024-09-15',
+      manualBudgetPeriod: null,
+      rawRuleAssignment: invalidRule,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'rule-assignment-invalid-period' },
+      ruleAssignment: {
+        kind: 'invalid',
+        raw: invalidRule,
+        error: { code: 'rule-assignment-invalid-period' },
+      },
+    });
+    expect(Object.hasOwn(result, 'projection')).toBe(false);
+  });
+
+  it('I19 returns Manual with a mandatory diagnostic for a masked invalid Rule', () => {
+    const result = deriveStoredBudgetPeriod({
+      bankDate: '2024-09-15',
+      manualBudgetPeriod: '2024-11',
+      rawRuleAssignment: invalidRule,
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      projection: {
+        budgetPeriod: '2024-11',
+        budgetPeriodSource: 'manual',
+      },
+      ruleAssignment: {
+        kind: 'invalid',
+        raw: invalidRule,
+        error: { code: 'rule-assignment-invalid-period' },
+      },
+      diagnostic: {
+        kind: 'invalid-rule-assignment',
+        error: { code: 'rule-assignment-invalid-period' },
+      },
+    });
+  });
+
+  it('I20 blocks when Manual removal reveals the same invalid Rule', () => {
+    const withManual = deriveStoredBudgetPeriod({
+      bankDate: '2024-09-15',
+      manualBudgetPeriod: '2024-11',
+      rawRuleAssignment: invalidRule,
+    });
+    const withoutManual = deriveStoredBudgetPeriod({
+      bankDate: '2024-09-15',
+      manualBudgetPeriod: null,
+      rawRuleAssignment: invalidRule,
+    });
+
+    expect(withManual.ok).toBe(true);
+    expect(withoutManual).toEqual({
+      ok: false,
+      error: { code: 'rule-assignment-invalid-period' },
+      ruleAssignment: {
+        kind: 'invalid',
+        raw: invalidRule,
+        error: { code: 'rule-assignment-invalid-period' },
+      },
+    });
+    expect(Object.hasOwn(withoutManual, 'projection')).toBe(false);
+  });
+
+  it('I21 blocks invalid Manual before using Rule or Default', () => {
+    const parseSpy = vi.spyOn(JSON, 'parse');
+    try {
+      const result = deriveStoredBudgetPeriod({
+        bankDate: '2024-09-15',
+        manualBudgetPeriod: '2024-13',
+        rawRuleAssignment: '{"period":"2024-10","ruleId":"rule-1"}',
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { code: 'invalid-budget-period' },
+      });
+      expect(Object.hasOwn(result, 'projection')).toBe(false);
+      expect(parseSpy).not.toHaveBeenCalled();
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it('rejects invalid bankDate before invalid Manual and canonical Rule', () => {
+    const parseSpy = vi.spyOn(JSON, 'parse');
+    try {
+      const result = deriveStoredBudgetPeriod({
+        bankDate: '2024-02-30',
+        manualBudgetPeriod: '2024-13',
+        rawRuleAssignment: '{"period":"2024-10","ruleId":"rule-1"}',
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { code: 'invalid-bank-date' },
+      });
+      expect(Object.hasOwn(result, 'projection')).toBe(false);
+      expect(parseSpy).not.toHaveBeenCalled();
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it('rejects invalid bankDate before absent Manual and invalid Rule', () => {
+    const parseSpy = vi.spyOn(JSON, 'parse');
+    try {
+      const result = deriveStoredBudgetPeriod({
+        bankDate: '2024-02-30',
+        manualBudgetPeriod: null,
+        rawRuleAssignment: '{"period":"2024-10"',
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { code: 'invalid-bank-date' },
+      });
+      expect(Object.hasOwn(result, 'projection')).toBe(false);
+      expect(parseSpy).not.toHaveBeenCalled();
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it('does not mutate its input or a raw invalid object', () => {
+    const rawRuleAssignment = Object.freeze({
+      period: '2024-10',
+      ruleId: 'rule-1',
+    });
+    const input = Object.freeze({
+      bankDate: '2024-09-15',
+      manualBudgetPeriod: '2024-11',
+      rawRuleAssignment,
+    });
+
+    const result = deriveStoredBudgetPeriod(input);
+
+    expect(result.ok).toBe(true);
+    expect(input.rawRuleAssignment).toBe(rawRuleAssignment);
+    if (result.ok && result.ruleAssignment.kind === 'invalid') {
+      expect(result.ruleAssignment.raw).toBe(rawRuleAssignment);
+    }
   });
 });
